@@ -1000,6 +1000,51 @@ class VirtualTerminal:
         self._auto_flush_decoder()
         rows = []
         last_non_empty = -1
+
+        # changed_only 模式：rows 直接是变化的扁平格列表，每项带 row/col + 完整属性
+        if changed_only and self._history and len(self._history) >= 2:
+            last_frame = self._history[-1]
+            changed_coords = last_frame.get("changed_cells", [])
+            flat_changed = []
+            for [r, c] in changed_coords:
+                if not (0 <= r < self.height and 0 <= c < self.width):
+                    continue
+                cell = self.grid[r][c]
+                cd = self._cell_to_dict(cell)
+                cd["row"] = r
+                cd["col"] = c
+                if mark_styled and (
+                    cell.style != 0 or
+                    cell.fg != COLOR_DEFAULT or
+                    cell.bg != COLOR_DEFAULT or
+                    cell.fg_rgb is not None or
+                    cell.bg_rgb is not None
+                ):
+                    cd["styled"] = True
+                flat_changed.append(cd)
+            data: dict = {
+                "width": self.width,
+                "height": self.height,
+                "cursor": {"row": self.cursor_row, "col": self.cursor_col,
+                           "visible": self.cursor_visible},
+                "scroll_region": {"top": self.scroll_top, "bottom": self.scroll_bottom},
+                "mode": {"auto_wrap": self.auto_wrap, "origin_mode": self.origin_mode},
+                "changed_only": True,
+                "rows": flat_changed,
+            }
+            if with_text:
+                data["text"] = self.get_screen_text(
+                    rstrip_lines=rstrip_lines, rstrip_trailing=rstrip_trailing,
+                )
+            if cursor_history and self._history:
+                data["cursor_history"] = [
+                    {"frame": f["frame"], "timestamp": f["timestamp"],
+                     "row": f["cursor"]["row"], "col": f["cursor"]["col"]}
+                    for f in self._history
+                ]
+            return data
+
+        # 普通 / changed_only 但没录制够 2 帧：按行结构输出
         for r in range(self.height):
             cells = []
             has_content = False
@@ -1036,7 +1081,7 @@ class VirtualTerminal:
         if rstrip_trailing and last_non_empty >= 0:
             rows = [row for row in rows if row["row"] <= last_non_empty]
 
-        data: dict = {
+        data = {
             "width": self.width,
             "height": self.height,
             "cursor": {"row": self.cursor_row, "col": self.cursor_col,
@@ -1055,8 +1100,6 @@ class VirtualTerminal:
                  "row": f["cursor"]["row"], "col": f["cursor"]["col"]}
                 for f in self._history
             ]
-        if changed_only and self._history:
-            data["changed_cells"] = list(self._history[-1]["changed_cells"])
         return data
 
     def to_json(self, indent: Optional[int] = 2, include_empty: bool = False,
@@ -1180,8 +1223,14 @@ class VirtualTerminal:
                 ))
         return tuple(out)
 
-    def _build_snapshot_dict(self, only_changed: bool = False) -> dict:
-        """构造一份当前屏幕的精简快照（可选择只输出与上一帧不同的格子）。"""
+    def _build_snapshot_dict(self, only_changed: bool = False,
+                             include_cleared: bool = False) -> dict:
+        """构造一份当前屏幕的精简快照。
+
+        - only_changed=True：只输出相对上一帧变化了的格子
+        - include_cleared=True：把"从有字符变空"的格子也作为空格输出，
+          用于 replay_frames 还原被清掉的内容
+        """
         rows = []
         prev = self._prev_snapshot_cells
         for r in range(self.height):
@@ -1193,14 +1242,17 @@ class VirtualTerminal:
                     cell.fg == COLOR_DEFAULT and cell.bg == COLOR_DEFAULT and
                     cell.fg_rgb is None and cell.bg_rgb is None
                 )
-                if only_changed and prev is not None:
+                diff_from_prev = False
+                if prev is not None:
                     flat = (
                         cell.char, cell.fg, cell.bg,
                         cell.fg_rgb, cell.bg_rgb, cell.style,
                     )
-                    if flat == prev[r * self.width + c]:
-                        continue
-                if is_empty and not only_changed:
+                    if flat != prev[r * self.width + c]:
+                        diff_from_prev = True
+                if only_changed and not diff_from_prev:
+                    continue
+                if is_empty and not only_changed and not (include_cleared and diff_from_prev):
                     continue
                 cd = self._cell_to_dict(cell)
                 cd["col"] = c
@@ -1245,7 +1297,7 @@ class VirtualTerminal:
         cursor_changed = (self._prev_snapshot_cursor is None or
                           cursor_now != self._prev_snapshot_cursor)
         frame_idx = len(self._history)
-        snapshot_dict = self._build_snapshot_dict(only_changed=False)
+        snapshot_dict = self._build_snapshot_dict(only_changed=False, include_cleared=True)
         self._history.append({
             "frame": frame_idx,
             "timestamp": timestamp,
@@ -1473,8 +1525,8 @@ def main(argv=None) -> int:
             if target_ts is not None:
                 stop_at = None
                 for i, (t, _) in enumerate(chunks):
-                    if t >= target_ts:
-                        stop_at = i + 1
+                    if t > target_ts:
+                        stop_at = i
                         break
                 if stop_at is None:
                     stop_at = len(chunks)

@@ -898,16 +898,28 @@ def test_json_export_enhancements():
     ok &= assert_eq(isinstance(d["text"], str), True, "text 字段是 str")
     ok &= assert_eq("Hello" in d["text"] and "plain" in d["text"], True, "text 字段含原文")
 
-    r0 = [r for r in d["rows"] if r["row"] == 0][0]
-    h_cell = [c for c in r0["cells"] if c.get("col") == 0][0]
-    ok &= assert_eq(h_cell.get("styled"), True, "彩色字符带 styled=True 标记")
+    # changed_only 模式: rows 为扁平格列表, 每项直接含 row/col + 属性
+    ok &= assert_eq(d.get("changed_only"), True, "changed_only 标记存在")
+    ok &= assert_eq(isinstance(d["rows"], list), True, "rows 是列表")
+    ok &= assert_eq(len(d["rows"]) > 0, True, "rows 非空")
+    first_cell = d["rows"][0]
+    ok &= assert_eq("row" in first_cell and "col" in first_cell and "ch" in first_cell,
+                    True, "changed_only 每个变化格含 row/col/ch")
+    # Hello 第 0 行第 0 列是红色粗体 H
+    h_cell = [c for c in d["rows"] if c.get("row") == 0 and c.get("col") == 0]
+    if h_cell:
+        ok &= assert_eq(h_cell[0].get("ch"), "H", "H 字符正确")
+        ok &= assert_eq(h_cell[0].get("styled"), True, "彩色格带 styled 标记")
+        ok &= assert_eq(h_cell[0].get("fg") is not None, True, "彩色格带 fg")
 
     ok &= assert_eq("cursor_history" in d, True, "含 cursor_history 字段")
     ok &= assert_eq(isinstance(d["cursor_history"], list), True, "cursor_history 是列表")
     ok &= assert_eq(len(d["cursor_history"]) >= 1, True, "cursor_history 非空")
 
-    ok &= assert_eq("changed_cells" in d, True, "含 changed_cells 字段")
-    ok &= assert_eq(isinstance(d["changed_cells"], list), True, "changed_cells 是列表")
+    # 非 changed_only 模式保持原行结构
+    d2 = vt.to_dict(with_text=False, changed_only=False)
+    ok &= assert_eq(isinstance(d2["rows"], list), True, "非 changed_only rows 是列表")
+    ok &= assert_eq("cells" in d2["rows"][0], True, "非 changed_only 每行含 cells")
 
     jstr = vt.to_json(with_text=True, mark_styled=True, ensure_ascii=False)
     jdata = json.loads(jstr)
@@ -1018,12 +1030,23 @@ def test_timestamped_log_parsing_and_cli_at():
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as outf:
         out_path = outf.name
     try:
+        # --at 0.8: 应包含 0.750 的 75%, 不包含 1.000 的 100%
         rc = main(["-f", tmp_path, "--timestamps", "--at", "0.8",
                    "-W", "40", "-H", "5", "-o", out_path])
-        ok &= assert_eq(rc, 0, "--at 回放 rc=0")
+        ok &= assert_eq(rc, 0, "--at 0.8 rc=0")
         with open(out_path, "r", encoding="utf-8") as f:
             out_text = f.read()
-        ok &= assert_eq(("Progress 75%" in out_text) or ("75" in out_text), True, "--at 0.8 快照含 75%")
+        ok &= assert_eq(("Progress 75%" in out_text) or ("75" in out_text),
+                        True, "--at 0.8 快照含 75%")
+        ok &= assert_eq("100%" not in out_text, True, "--at 0.8 不含 100%")
+
+        # --at 1.000: 刚好等于时间戳, 应包含该条, 即出现 100%
+        rc2 = main(["-f", tmp_path, "--timestamps", "--at", "1.000",
+                    "-W", "40", "-H", "5", "-o", out_path])
+        ok &= assert_eq(rc2, 0, "--at 1.000 rc=0")
+        with open(out_path, "r", encoding="utf-8") as f:
+            out_text2 = f.read()
+        ok &= assert_eq("100%" in out_text2, True, "--at 1.000 含 100%")
     finally:
         for p in (tmp_path, out_path):
             try:
@@ -1063,6 +1086,129 @@ def test_cli_record_and_frame_seek():
         ok &= assert_eq(hd["total_frames"] >= 2, True, f"至少 2 帧 (初始 + feed = {hd['total_frames']})")
     finally:
         for p in (tmp_path, out1_path, out2_path):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_clear_and_replay_consistency():
+    print("\n=== Test 43: 清屏/清行/删字符后录制回放与原画面一致 ===")
+    # 验收样例: 先写满一行, 再清掉中间几格, 重放后中间不能残留
+    vt1 = VirtualTerminal(width=40, height=5)
+    vt1.start_recording()
+    vt1.feed("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd")
+    # 光标回到列 10, 清行从光标到行末, 即 [10..39] 清空
+    vt1.feed(f"{ESC}[11G{ESC}[0K")
+    # 再删掉第 3 列的 2 个字符 (DCH)
+    vt1.feed(f"{ESC}[4G{ESC}[2P")
+    frames = vt1.stop_recording()
+    original_text = vt1.get_screen_text()
+    original_row0 = vt1.get_line_text(0, rstrip=False)
+
+    # 导出 JSON 再导入 (模拟跨进程)
+    import json as _json
+    dump = _json.dumps(frames, ensure_ascii=False)
+    reloaded = _json.loads(dump)
+
+    vt2 = VirtualTerminal(width=40, height=5)
+    vt2.replay_frames(reloaded)
+    replayed_text = vt2.get_screen_text()
+    replayed_row0 = vt2.get_line_text(0, rstrip=False)
+
+    ok = assert_eq(replayed_text, original_text, "重放后整屏纯文本与原过程一致")
+    ok &= assert_eq(replayed_row0, original_row0, "重放后第 0 行与原过程逐字符一致")
+
+    # 关键验收: 原被清掉的位置 [10..] 和被 DCH 删掉的 cols 3-4 不能残留旧字符
+    # original_row0 应该是: ABC GHIJ... (DE 被删, 第 10 列起为空格)
+    for col in range(10, 40):
+        ok &= assert_eq(vt2.grid[0][col].char == " ", True,
+                        f"col {col} 已被清行清空, 不应残留旧字符")
+
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_changed_only_json_flat_structure():
+    print("\n=== Test 44: changed-only JSON 直接输出扁平变化格完整属性 ===")
+    vt = VirtualTerminal(width=30, height=6)
+    vt.start_recording()
+    vt.feed("Initial line")
+    vt.feed(f"\n{ESC}[1;33mSecond{ESC}[0m line")
+    # 第 3 次 feed 产生相对上一帧的变化: 写入带样式的 Third
+    vt.feed(f"\n{ESC}[38;5;196mThird colored row{ESC}[0m")
+
+    d = vt.to_dict(changed_only=True, mark_styled=True, with_text=True)
+    ok = assert_eq(d.get("changed_only"), True, "changed_only 标记存在")
+    ok &= assert_eq(isinstance(d["rows"], list), True, "rows 是列表 (扁平)")
+
+    # 每个格直接含 row/col/ch, 不再嵌套 per-row cells
+    for cell in d["rows"]:
+        ok &= assert_eq("row" in cell, True, "扁平格含 row")
+        ok &= assert_eq("col" in cell, True, "扁平格含 col")
+        ok &= assert_eq("ch" in cell, True, "扁平格含 ch")
+
+    # 样式字符 (Third colored row 中 T 是 256 色红 fg=196) 带 styled 和 fg
+    red_T = [c for c in d["rows"]
+             if c.get("row") == 2 and c.get("col") == 0]
+    ok &= assert_eq(len(red_T) >= 1, True, "找到第 2 行第 0 列的红色 T")
+    if red_T:
+        ok &= assert_eq(red_T[0]["ch"], "T", "字符 T 正确")
+        ok &= assert_eq(red_T[0].get("styled"), True, "红色 T 带 styled=True")
+        ok &= assert_eq(red_T[0].get("fg") is not None, True, "红色 T 带 fg 颜色")
+
+    # with_text 字段仍能直接还原最终纯文本
+    ok &= assert_eq("Third colored row" in d.get("text", ""), True, "text 含最终内容")
+
+    vt.stop_recording()
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_timestamp_at_boundary_regression():
+    print("\n=== Test 45: 时间戳边界回归 (0.800 不含 1.000, 1.000 含) ===")
+    from ansi_terminal import main
+    log_bytes = (
+        b"[0.000] Init\n"
+        b"[0.500] StepA\n"
+        b"[1.000] StepB\n"
+        b"[1.500] Done\n"
+    )
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=".log", delete=False) as tmp:
+        tmp.write(log_bytes)
+        tmp_path = tmp.name
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as outf:
+        out_path = outf.name
+    try:
+        # --at 0.8: 应包含 StepA (0.500 <= 0.8), 不含 StepB (1.000 > 0.8)
+        rc1 = main(["-f", tmp_path, "--timestamps", "--at", "0.8",
+                    "-W", "30", "-H", "5", "-o", out_path])
+        ok = assert_eq(rc1, 0, "class=0.8 rc=0")
+        with open(out_path, "r", encoding="utf-8") as f:
+            t1 = f.read()
+        ok &= assert_eq("StepA" in t1, True, "0.8s 含 StepA")
+        ok &= assert_eq("StepB" not in t1, True, "0.8s 不含 StepB")
+
+        # --at 1.000: 刚好等于时间戳, StepB 应被包含
+        rc2 = main(["-f", tmp_path, "--timestamps", "--at", "1.000",
+                    "-W", "30", "-H", "5", "-o", out_path])
+        ok &= assert_eq(rc2, 0, "--at 1.000 rc=0")
+        with open(out_path, "r", encoding="utf-8") as f:
+            t2 = f.read()
+        ok &= assert_eq("StepB" in t2, True, "1.000s 含 StepB")
+        ok &= assert_eq("Done" not in t2, True, "1.000s 不含 Done (1.500)")
+
+        # --at 1.500: 含 Done
+        rc3 = main(["-f", tmp_path, "--timestamps", "--at", "1.500",
+                    "-W", "30", "-H", "5", "-o", out_path])
+        ok &= assert_eq(rc3, 0, "--at 1.500 rc=0")
+        with open(out_path, "r", encoding="utf-8") as f:
+            t3 = f.read()
+        ok &= assert_eq("Done" in t3, True, "1.500s 含 Done")
+    finally:
+        for p in (tmp_path, out_path):
             try:
                 os.unlink(p)
             except Exception:
@@ -1119,6 +1265,9 @@ def run_all_tests():
         test_cli_pipeline_stdin_vs_file_consistency,
         test_timestamped_log_parsing_and_cli_at,
         test_cli_record_and_frame_seek,
+        test_clear_and_replay_consistency,
+        test_changed_only_json_flat_structure,
+        test_timestamp_at_boundary_regression,
     ]
 
     passed = 0
