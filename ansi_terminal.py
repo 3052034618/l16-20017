@@ -584,14 +584,13 @@ class VirtualTerminal:
         """
         统一输入接口：接受 str / bytes / bytearray / memoryview。
 
-        - 传入 str: final 参数可省，直接逐字符解析
-        - 传入 bytes-like: 使用内部增量 UTF-8 解码器。final=None 时，
-          如果后续还要继续喂 chunk，请显式传 final=False；当最后一个
-          数据块到达时传 final=True 以刷新残留的半个字符。
+        - 传入 str: 直接逐字符解析
+        - 传入 bytes-like: 自动使用内部增量 UTF-8 解码器，不需要额外开关。
+          连续喂多个 bytes 小块（哪怕单字节），最后取屏幕内容时
+          会自动 flush 解码器，结果与一次性喂完整文本完全一致。
+          显式传 final=True 可强制刷新。
         """
         if isinstance(data, str):
-            if final is None:
-                final = True
             for ch in data:
                 self._feed_char(ch)
             if self._recording:
@@ -603,9 +602,12 @@ class VirtualTerminal:
                 f"feed() expects str / bytes / bytearray / memoryview, "
                 f"got {type(data).__name__}"
             )
-        if final is None:
-            final = True
         data_bytes = bytes(data)
+        if final is None:
+            if len(data_bytes) == 0:
+                final = True
+            else:
+                final = False
         text = self._utf8_decoder.decode(data_bytes, final=final)
         if text:
             for ch in text:
@@ -613,7 +615,7 @@ class VirtualTerminal:
         if self._recording:
             self._record_snapshot(timestamp=None)
 
-    def feed_bytes(self, data: Union[bytes, bytearray, memoryview], final: bool = True):
+    def feed_bytes(self, data: Union[bytes, bytearray, memoryview], final: Optional[bool] = None):
         """兼容旧 API: 等价于 feed(data, final=final)."""
         self.feed(data, final=final)
 
@@ -627,6 +629,15 @@ class VirtualTerminal:
 
     def reset_decoder(self):
         self._utf8_decoder.reset()
+
+    def _auto_flush_decoder(self) -> None:
+        """在读取屏幕输出前自动 flush UTF-8 解码器，保证半个字符不丢。"""
+        leftover = self._utf8_decoder.decode(b"", final=True)
+        if leftover:
+            for ch in leftover:
+                self._feed_char(ch)
+            if self._recording:
+                self._record_snapshot(timestamp=None)
 
     # =================================================================
     # 保存/恢复光标 (DECSC / DECRC)
@@ -829,6 +840,7 @@ class VirtualTerminal:
     # =================================================================
 
     def get_line_text(self, row: int, rstrip: bool = True) -> str:
+        self._auto_flush_decoder()
         if not (0 <= row < self.height):
             return ""
         chars = [cell.char for cell in self.grid[row]]
@@ -884,6 +896,7 @@ class VirtualTerminal:
         return "\x1b[" + ";".join(parts) + "m"
 
     def render_ansi(self, rstrip_lines: bool = True, rstrip_trailing: bool = True) -> str:
+        self._auto_flush_decoder()
         result = io.StringIO()
         lines = []
         for r in range(self.height):
@@ -937,11 +950,13 @@ class VirtualTerminal:
         return "\n".join(lines)
 
     def get_cell(self, row: int, col: int) -> Optional[Cell]:
+        self._auto_flush_decoder()
         if 0 <= row < self.height and 0 <= col < self.width:
             return self.grid[row][col]
         return None
 
     def snapshot(self) -> List[List[Cell]]:
+        self._auto_flush_decoder()
         return [[Cell(
             char=c.char, fg=c.fg, bg=c.bg,
             fg_rgb=c.fg_rgb, bg_rgb=c.bg_rgb, style=c.style
@@ -982,6 +997,7 @@ class VirtualTerminal:
                 changed_only: bool = False,
                 with_text: bool = False,
                 mark_styled: bool = False) -> dict:
+        self._auto_flush_decoder()
         rows = []
         last_non_empty = -1
         for r in range(self.height):
@@ -1080,6 +1096,7 @@ class VirtualTerminal:
 
     def get_history(self) -> List[dict]:
         """返回当前录制的历史帧（每个元素是一次 feed() 之后的差量）。"""
+        self._auto_flush_decoder()
         return list(self._history)
 
     def seek_snapshot(self, index: int) -> Optional[dict]:
@@ -1087,6 +1104,7 @@ class VirtualTerminal:
         根据录制历史中的帧序号，返回那一帧的完整屏幕快照 dict。
         index 支持负数（-1 表示最后一帧）。
         """
+        self._auto_flush_decoder()
         if not self._history:
             return None
         if index < 0:
@@ -1456,7 +1474,7 @@ def main(argv=None) -> int:
                 stop_at = None
                 for i, (t, _) in enumerate(chunks):
                     if t >= target_ts:
-                        stop_at = i
+                        stop_at = i + 1
                         break
                 if stop_at is None:
                     stop_at = len(chunks)
