@@ -743,6 +743,332 @@ def test_chunked_bytes_matches_full_string():
 
 
 import json
+import io
+import os
+import tempfile
+import random
+
+
+def test_unified_feed_accepts_all_types():
+    print("\n=== Test 33: 统一 feed() 接受 str/bytes/bytearray/memoryview ===")
+    text = "Hello 中文 \U0001F600"
+    ok = True
+    for payload in (
+        text,
+        text.encode("utf-8"),
+        bytearray(text.encode("utf-8")),
+        memoryview(text.encode("utf-8")),
+    ):
+        vt = VirtualTerminal(width=40, height=5)
+        vt.feed(payload)
+        got = vt.get_line_text(0)
+        ok &= assert_eq(got, text, f"feed({type(payload).__name__}) correct")
+    try:
+        vt_bad = VirtualTerminal(10, 3)
+        vt_bad.feed(12345)
+        ok &= False
+    except TypeError:
+        pass
+    except Exception as e:
+        ok &= False
+        print(f"  unexpected exception: {e}")
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_feed_bytes_byte_by_byte_consistency():
+    print("\n=== Test 34: 单字节逐个喂 vs 完整字符串 完全一致 ===")
+    data = (
+        f"{ESC}[2J{ESC}[H"
+        f"{ESC}[1;31mLine1 red{ESC}[0m\n"
+        f"{ESC}[1;32mLine2 green{ESC}[0m with \u4e2d\u6587\n"
+        f"emoji: \U0001F600 \U0001F603\n"
+    ).encode("utf-8")
+
+    vt_full = VirtualTerminal(60, 10)
+    vt_full.feed(data.decode("utf-8"))
+    expected_text = vt_full.get_screen_text()
+
+    vt_1b = VirtualTerminal(60, 10)
+    for b in data:
+        vt_1b.feed(bytes([b]), final=False)
+    vt_1b.feed(b"", final=True)
+    ok = assert_eq(vt_1b.get_screen_text(), expected_text,
+                   "byte-by-byte feed matches full string")
+
+    for n in (1, 2, 3, 5, 7, 11, 16):
+        random.seed(n)
+        vt_rnd = VirtualTerminal(60, 10)
+        i = 0
+        while i < len(data):
+            sz = random.randint(1, n)
+            end = min(i + sz, len(data))
+            vt_rnd.feed(data[i:end], final=(end >= len(data)))
+            i = end
+        ok &= assert_eq(vt_rnd.get_screen_text(), expected_text,
+                        f"random chunk size={n} matches")
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_progress_bar_carriage_return_rewrite():
+    print("\n=== Test 35: 彩色进度条反复 CR 覆盖 ===")
+    vt = VirtualTerminal(width=60, height=5)
+    vt.start_recording()
+    for pct in (10, 25, 50, 75, 100):
+        filled = pct // 2
+        bar = "[" + "#" * filled + "-" * (50 - filled) + f"] {pct:3d}%"
+        vt.feed(f"\r{ESC}[32m{bar}{ESC}[0m")
+    hist = vt.get_history()
+    ok = assert_eq(len(hist) >= 5, True, f"至少 5 帧 (实际 {len(hist)})")
+    ok &= assert_eq(vt.cursor_row, 0, "进度条始终在第 0 行")
+    final_line = vt.get_line_text(0)
+    expected_final = "[" + "#" * 50 + "] 100%"
+    ok &= assert_eq(expected_final in final_line, True, f"最终帧含 {expected_final!r}")
+    first_changed = hist[1]["changed_cells"]
+    ok &= assert_eq(len(first_changed) > 0, True, "帧间确实记录了变化")
+    vt.stop_recording()
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_recording_seek_and_replay():
+    print("\n=== Test 36: 录制 seek_snapshot / replay_frames ===")
+    vt = VirtualTerminal(width=30, height=8)
+    vt.start_recording()
+    vt.feed("Line A\n")
+    vt.feed("Line B\n")
+    vt.feed("Line C\n")
+    vt.feed(f"{ESC}[2;5HINJECTED\n")
+    frames = vt.stop_recording()
+
+    ok = assert_eq(len(frames) >= 4, True, f"录制 {len(frames)} 帧")
+    snap_end = vt.seek_snapshot(-1)
+    ok &= assert_eq(snap_end is not None, True, "seek_snapshot(-1) 有结果")
+    ok &= assert_eq(snap_end.get("cursor", {}).get("row") is not None, True, "snapshot 含 cursor")
+
+    snap_frame2 = vt.seek_snapshot(2)
+    ok &= assert_eq(snap_frame2 is not None, True, "seek_snapshot(2) 有结果")
+
+    vt2 = VirtualTerminal(width=30, height=8)
+    vt2.replay_frames(frames)
+    ok &= assert_eq(vt2.get_line_text(0), "Line A", "replay 后第 0 行一致")
+    ok &= assert_eq(vt2.get_line_text(1).startswith("LineINJECTED"), True, "replay 后 INJECTED 覆盖生效")
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_scroll_region_insert_delete_lines_realistic():
+    print("\n=== Test 37: 滚动区域内插入删除行 (ncurses 菜单风格) ===")
+    vt = VirtualTerminal(width=40, height=10)
+    vt.feed(f"{ESC}[2;9r")
+
+    for i in range(1, 9):
+        vt.feed(f"Item {i}\n")
+    vt.feed(f"{ESC}[2;1H")
+
+    vt.feed(f"{ESC}[1L")
+    vt.feed(f"{ESC}[1;33m  -> NEW ITEM <-{ESC}[0m")
+
+    ok = assert_eq(vt.scroll_top, 1, "scroll_top=1")
+    ok &= assert_eq(vt.scroll_bottom, 8, "scroll_bottom=8")
+    ok &= assert_eq("NEW ITEM" in vt.get_line_text(1), True, "NEW ITEM 写入 row1")
+
+    vt.feed(f"{ESC}[4;1H")
+    vt.feed(f"{ESC}[2M")
+
+    ok &= assert_eq(("Item 5" in vt.get_line_text(3)) or ("Item 6" in vt.get_line_text(3)), True, "row3 存在Item 5/6")
+    last_row_text = vt.get_line_text(8)
+    ok &= assert_eq(last_row_text.strip() == "", True, "滚动区域底部是空行")
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_json_export_enhancements():
+    print("\n=== Test 38: JSON 增强选项 (with_text/mark_styled/cursor_history/changed_only) ===")
+    vt = VirtualTerminal(width=20, height=6)
+    vt.start_recording()
+    vt.feed(f"{ESC}[1;31mHello{ESC}[0m world")
+    vt.feed(f"\nplain line here")
+
+    d = vt.to_dict(with_text=True, mark_styled=True,
+                   cursor_history=True, changed_only=True)
+
+    ok = assert_eq("text" in d, True, "dict 含 text 字段")
+    ok &= assert_eq(isinstance(d["text"], str), True, "text 字段是 str")
+    ok &= assert_eq("Hello" in d["text"] and "plain" in d["text"], True, "text 字段含原文")
+
+    r0 = [r for r in d["rows"] if r["row"] == 0][0]
+    h_cell = [c for c in r0["cells"] if c.get("col") == 0][0]
+    ok &= assert_eq(h_cell.get("styled"), True, "彩色字符带 styled=True 标记")
+
+    ok &= assert_eq("cursor_history" in d, True, "含 cursor_history 字段")
+    ok &= assert_eq(isinstance(d["cursor_history"], list), True, "cursor_history 是列表")
+    ok &= assert_eq(len(d["cursor_history"]) >= 1, True, "cursor_history 非空")
+
+    ok &= assert_eq("changed_cells" in d, True, "含 changed_cells 字段")
+    ok &= assert_eq(isinstance(d["changed_cells"], list), True, "changed_cells 是列表")
+
+    jstr = vt.to_json(with_text=True, mark_styled=True, ensure_ascii=False)
+    jdata = json.loads(jstr)
+    ok &= assert_eq(jdata.get("text"), d["text"], "JSON text 字段一致")
+    vt.stop_recording()
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_history_to_json_export():
+    print("\n=== Test 39: history_to_json 帧级差量导出 ===")
+    vt = VirtualTerminal(width=30, height=6)
+    vt.start_recording()
+    vt.feed("Step 1")
+    vt.feed("\nStep 2")
+    vt.feed(f"\n{ESC}[1;34mStep 3 colored{ESC}[0m")
+    hist_json = vt.history_to_json(indent=None, with_full_snapshot=True)
+    d = json.loads(hist_json)
+    ok = assert_eq(d["width"], 30, "width 正确")
+    ok &= assert_eq(d["height"], 6, "height 正确")
+    ok &= assert_eq(d["total_frames"] >= 3, True, f"至少 3 帧 (实际 {d['total_frames']})")
+    first_frame = d["frames"][0]
+    ok &= assert_eq("changed_cells" in first_frame, True, "帧含 changed_cells")
+    ok &= assert_eq("cursor" in first_frame, True, "帧含 cursor")
+    ok &= assert_eq("snapshot" in first_frame, True, "帧含 snapshot")
+    last_frame = d["frames"][-1]
+    snap_rows = last_frame.get("snapshot", {}).get("rows", [])
+    row_chars = {}
+    for r in snap_rows:
+        for c in r.get("cells", []):
+            row_chars.setdefault(r["row"], {})[c["col"]] = c["ch"]
+    last_row = row_chars.get(2, {})
+    last_line = "".join(last_row.get(c, " ") for c in range(max(last_row.keys(), default=-1) + 1))
+    ok &= assert_eq("Step 3" in last_line, True, "末帧快照含 Step 3")
+    vt.stop_recording()
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_cli_pipeline_stdin_vs_file_consistency():
+    print("\n=== Test 40: CLI 管道大文件 stdin 读 vs 读文件 一致 ===")
+    from ansi_terminal import main
+    lines = []
+    for i in range(200):
+        color = 30 + (i % 8)
+        lines.append(f"\x1b[{color}mLine {i:04d} content\x1b[0m")
+    payload = "\n".join(lines).encode("utf-8")
+
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=".log", delete=False) as tmp:
+        tmp.write(payload)
+        tmp_path = tmp.name
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as out1:
+        out1_path = out1.name
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as out2:
+        out2_path = out2.name
+    try:
+        rc1 = main(["-f", tmp_path, "-W", "60", "-H", "220", "-o", out1_path])
+        ok = assert_eq(rc1, 0, "文件模式 rc=0")
+
+        old_stdin = sys.stdin
+        try:
+            bio = io.BytesIO(payload)
+            sys.stdin = type(
+                "FakeStdin", (),
+                {"buffer": bio, "read": lambda self, *a, **kw: bio.read()},
+            )()
+            rc2 = main(["-W", "60", "-H", "220", "-o", out2_path])
+        finally:
+            sys.stdin = old_stdin
+        ok &= assert_eq(rc2, 0, "stdin 模式 rc=0")
+
+        with open(out1_path, "r", encoding="utf-8") as f:
+            a = f.read()
+        with open(out2_path, "r", encoding="utf-8") as f:
+            b = f.read()
+        ok &= assert_eq(a, b, "两种输入方式输出完全一致")
+    finally:
+        for p in (tmp_path, out1_path, out2_path):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_timestamped_log_parsing_and_cli_at():
+    print("\n=== Test 41: 带时间戳日志解析 + --at 回放 ===")
+    from ansi_terminal import main, _parse_ts, _split_timestamped_log
+
+    ok = assert_eq(_parse_ts("00:00:01.500"), 1.5, "HH:MM:SS.mmm")
+    ok &= assert_eq(_parse_ts("01:23"), 60 + 23, "MM:SS")
+    ok &= assert_eq(_parse_ts("123.45"), 123.45, "纯秒数")
+    ok &= assert_eq(_parse_ts("[3.5]"), 3.5, "方括号秒数")
+    ok &= assert_eq(_parse_ts("+2.1"), 2.1, "+ 秒数")
+
+    log_bytes = (
+        b"0.000 Starting up\n"
+        b"0.500 Progress 50%\r0.750 Progress 75%\r1.000 Progress 100%\n"
+        b"1.500 [INFO] done\n"
+    )
+    chunks = _split_timestamped_log(log_bytes)
+    ok &= assert_eq(len(chunks) >= 3, True, f"切出 {len(chunks)} 段 (>=3)")
+
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=".log", delete=False) as tmp:
+        tmp.write(log_bytes)
+        tmp_path = tmp.name
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as outf:
+        out_path = outf.name
+    try:
+        rc = main(["-f", tmp_path, "--timestamps", "--at", "0.8",
+                   "-W", "40", "-H", "5", "-o", out_path])
+        ok &= assert_eq(rc, 0, "--at 回放 rc=0")
+        with open(out_path, "r", encoding="utf-8") as f:
+            out_text = f.read()
+        ok &= assert_eq(("Progress 75%" in out_text) or ("75" in out_text), True, "--at 0.8 快照含 75%")
+    finally:
+        for p in (tmp_path, out_path):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_cli_record_and_frame_seek():
+    print("\n=== Test 42: CLI --record --frame 帧级回放 ===")
+    from ansi_terminal import main
+    log_bytes = b"AAAA\nBBBB\nCCCC\nDDDD\n"
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=".log", delete=False) as tmp:
+        tmp.write(log_bytes)
+        tmp_path = tmp.name
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as out1:
+        out1_path = out1.name
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as out2:
+        out2_path = out2.name
+    try:
+        rc = main(["-f", tmp_path, "--record", "--frame", "2",
+                   "-W", "30", "-H", "10", "-o", out1_path])
+        ok = assert_eq(rc, 0, "--frame 2 rc=0")
+        with open(out1_path, "r", encoding="utf-8") as f:
+            t = f.read()
+        ok &= assert_eq("AAAA" in t, True, "frame2 含 AAAA")
+        ok &= assert_eq("BBBB" in t, True, "frame2 含 BBBB")
+
+        rc2 = main(["-f", tmp_path, "--record", "--history",
+                    "-W", "30", "-H", "10", "-o", out2_path])
+        ok &= assert_eq(rc2, 0, "--history rc=0")
+        with open(out2_path, "r", encoding="utf-8") as f:
+            hd = json.load(f)
+        ok &= assert_eq("total_frames" in hd, True, "history 含 total_frames")
+        ok &= assert_eq(hd["total_frames"] >= 2, True, f"至少 2 帧 (初始 + feed = {hd['total_frames']})")
+    finally:
+        for p in (tmp_path, out1_path, out2_path):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+    print("PASS" if ok else "FAIL")
+    return ok
 
 
 def run_all_tests():
@@ -783,6 +1109,16 @@ def run_all_tests():
         test_json_export,
         test_cli_args_and_helpers,
         test_chunked_bytes_matches_full_string,
+        test_unified_feed_accepts_all_types,
+        test_feed_bytes_byte_by_byte_consistency,
+        test_progress_bar_carriage_return_rewrite,
+        test_recording_seek_and_replay,
+        test_scroll_region_insert_delete_lines_realistic,
+        test_json_export_enhancements,
+        test_history_to_json_export,
+        test_cli_pipeline_stdin_vs_file_consistency,
+        test_timestamped_log_parsing_and_cli_at,
+        test_cli_record_and_frame_seek,
     ]
 
     passed = 0

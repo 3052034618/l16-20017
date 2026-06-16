@@ -162,6 +162,11 @@ class VirtualTerminal:
         self._utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._saved_cursor: Optional[dict] = None
 
+        self._recording: bool = False
+        self._history: List[dict] = []
+        self._prev_snapshot_cells: Optional[Tuple] = None
+        self._prev_snapshot_cursor: Optional[Tuple[int, int]] = None
+
     # =================================================================
     # 屏幕基础操作
     # =================================================================
@@ -570,25 +575,55 @@ class VirtualTerminal:
             self.restore_cursor()
 
     # =================================================================
-    # 字节流/数据流输入接口 (支持 bytes, bytearray, 分块读取)
+    # 主解析循环 —— 状态机
     # =================================================================
 
-    def feed_bytes(self, data: Union[bytes, bytearray, memoryview], final: bool = True):
-        if isinstance(data, (bytes, bytearray, memoryview)):
-            data = bytes(data)
-        else:
-            raise TypeError(f"feed_bytes expects bytes/bytearray/memoryview, got {type(data).__name__}")
-        text = self._utf8_decoder.decode(data, final=final)
+    _InputT = Union[str, bytes, bytearray, memoryview]
+
+    def feed(self, data: _InputT, final: Optional[bool] = None) -> None:
+        """
+        统一输入接口：接受 str / bytes / bytearray / memoryview。
+
+        - 传入 str: final 参数可省，直接逐字符解析
+        - 传入 bytes-like: 使用内部增量 UTF-8 解码器。final=None 时，
+          如果后续还要继续喂 chunk，请显式传 final=False；当最后一个
+          数据块到达时传 final=True 以刷新残留的半个字符。
+        """
+        if isinstance(data, str):
+            if final is None:
+                final = True
+            for ch in data:
+                self._feed_char(ch)
+            if self._recording:
+                self._record_snapshot(timestamp=None)
+            return
+
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError(
+                f"feed() expects str / bytes / bytearray / memoryview, "
+                f"got {type(data).__name__}"
+            )
+        if final is None:
+            final = True
+        data_bytes = bytes(data)
+        text = self._utf8_decoder.decode(data_bytes, final=final)
         if text:
-            self.feed(text)
+            for ch in text:
+                self._feed_char(ch)
+        if self._recording:
+            self._record_snapshot(timestamp=None)
+
+    def feed_bytes(self, data: Union[bytes, bytearray, memoryview], final: bool = True):
+        """兼容旧 API: 等价于 feed(data, final=final)."""
+        self.feed(data, final=final)
 
     def feed_stream(self, stream: BinaryIO, chunk_size: int = 8192):
         while True:
             chunk = stream.read(chunk_size)
             if not chunk:
-                self.feed_bytes(b"", final=True)
+                self.feed(b"", final=True)
                 break
-            self.feed_bytes(chunk, final=False)
+            self.feed(chunk, final=False)
 
     def reset_decoder(self):
         self._utf8_decoder.reset()
@@ -694,12 +729,8 @@ class VirtualTerminal:
                 self.grid[self.scroll_bottom][c].reset()
 
     # =================================================================
-    # 主解析循环 —— 状态机
+    # 主解析循环 —— 状态机 (核心逻辑在前面的 feed() 中)
     # =================================================================
-
-    def feed(self, data: str):
-        for ch in data:
-            self._feed_char(ch)
 
     def _feed_char(self, ch: str):
         state = self._parse_state
@@ -946,7 +977,11 @@ class VirtualTerminal:
         return d
 
     def to_dict(self, include_empty: bool = False, rstrip_lines: bool = True,
-                rstrip_trailing: bool = True) -> dict:
+                rstrip_trailing: bool = True,
+                cursor_history: bool = False,
+                changed_only: bool = False,
+                with_text: bool = False,
+                mark_styled: bool = False) -> dict:
         rows = []
         last_non_empty = -1
         for r in range(self.height):
@@ -962,6 +997,14 @@ class VirtualTerminal:
                 if include_empty or not is_empty:
                     cd = self._cell_to_dict(cell)
                     cd["col"] = c
+                    if mark_styled and (
+                        cell.style != 0 or
+                        cell.fg != COLOR_DEFAULT or
+                        cell.bg != COLOR_DEFAULT or
+                        cell.fg_rgb is not None or
+                        cell.bg_rgb is not None
+                    ):
+                        cd["styled"] = True
                     cells.append(cd)
                     if not is_empty:
                         has_content = True
@@ -976,7 +1019,8 @@ class VirtualTerminal:
                 rows.append(row_data)
         if rstrip_trailing and last_non_empty >= 0:
             rows = [row for row in rows if row["row"] <= last_non_empty]
-        return {
+
+        data: dict = {
             "width": self.width,
             "height": self.height,
             "cursor": {"row": self.cursor_row, "col": self.cursor_col,
@@ -985,14 +1029,216 @@ class VirtualTerminal:
             "mode": {"auto_wrap": self.auto_wrap, "origin_mode": self.origin_mode},
             "rows": rows,
         }
+        if with_text:
+            data["text"] = self.get_screen_text(
+                rstrip_lines=rstrip_lines, rstrip_trailing=rstrip_trailing,
+            )
+        if cursor_history and self._history:
+            data["cursor_history"] = [
+                {"frame": f["frame"], "timestamp": f["timestamp"],
+                 "row": f["cursor"]["row"], "col": f["cursor"]["col"]}
+                for f in self._history
+            ]
+        if changed_only and self._history:
+            data["changed_cells"] = list(self._history[-1]["changed_cells"])
+        return data
 
     def to_json(self, indent: Optional[int] = 2, include_empty: bool = False,
                 rstrip_lines: bool = True, rstrip_trailing: bool = True,
-                ensure_ascii: bool = False) -> str:
-        data = self.to_dict(include_empty=include_empty,
-                            rstrip_lines=rstrip_lines,
-                            rstrip_trailing=rstrip_trailing)
+                ensure_ascii: bool = False,
+                cursor_history: bool = False,
+                changed_only: bool = False,
+                with_text: bool = False,
+                mark_styled: bool = False) -> str:
+        data = self.to_dict(
+            include_empty=include_empty,
+            rstrip_lines=rstrip_lines,
+            rstrip_trailing=rstrip_trailing,
+            cursor_history=cursor_history,
+            changed_only=changed_only,
+            with_text=with_text,
+            mark_styled=mark_styled,
+        )
         return json.dumps(data, indent=indent, ensure_ascii=ensure_ascii)
+
+    # =================================================================
+    # 录制 / 回放 (Recording / Playback)
+    # =================================================================
+
+    def start_recording(self) -> None:
+        """开启屏幕变化录制。每次 feed() 之后都会记录一次差量快照。"""
+        self._recording = True
+        self._history = []
+        self._prev_snapshot_cells = None
+        self._prev_snapshot_cursor = None
+        self._record_snapshot(timestamp=0.0)
+
+    def stop_recording(self) -> None:
+        """停止录制，返回已经记录的历史帧列表。"""
+        self._recording = False
+        return list(self._history)
+
+    def get_history(self) -> List[dict]:
+        """返回当前录制的历史帧（每个元素是一次 feed() 之后的差量）。"""
+        return list(self._history)
+
+    def seek_snapshot(self, index: int) -> Optional[dict]:
+        """
+        根据录制历史中的帧序号，返回那一帧的完整屏幕快照 dict。
+        index 支持负数（-1 表示最后一帧）。
+        """
+        if not self._history:
+            return None
+        if index < 0:
+            index = max(0, len(self._history) + index)
+        index = min(index, len(self._history) - 1)
+        return self._history[index].get("snapshot")
+
+    def seek_frame(self, index: int) -> Optional[dict]:
+        """返回第 index 帧的原始记录（含 changed、cursor 等）。"""
+        if not self._history:
+            return None
+        if index < 0:
+            index = max(0, len(self._history) + index)
+        index = min(index, len(self._history) - 1)
+        return self._history[index]
+
+    def replay_frames(self, frames: List[dict]) -> None:
+        """把之前记录的帧重新应用到当前屏幕（以 diff 方式逐个重放）。"""
+        for frame in frames:
+            snap = frame.get("snapshot")
+            if not snap:
+                continue
+            for row_data in snap.get("rows", []):
+                r = row_data["row"]
+                for cd in row_data.get("cells", []):
+                    c = cd["col"]
+                    if 0 <= r < self.height and 0 <= c < self.width:
+                        cell = self.grid[r][c]
+                        cell.char = cd.get("ch", " ")
+                        cell.fg = cd.get("fg", COLOR_DEFAULT)
+                        cell.bg = cd.get("bg", COLOR_DEFAULT)
+                        cell.fg_rgb = tuple(cd["fg_rgb"]) if cd.get("fg_rgb") else None
+                        cell.bg_rgb = tuple(cd["bg_rgb"]) if cd.get("bg_rgb") else None
+                        cell.style = cd.get("style", 0)
+            cur = snap.get("cursor")
+            if cur:
+                self.cursor_row = cur.get("row", self.cursor_row)
+                self.cursor_col = cur.get("col", self.cursor_col)
+
+    def history_to_json(self, indent: Optional[int] = 2,
+                        ensure_ascii: bool = False,
+                        with_full_snapshot: bool = False) -> str:
+        """把录制历史导出为 JSON（用于日志分析脚本消费）。"""
+        frames = []
+        for frame in self._history:
+            f = {
+                "frame": frame["frame"],
+                "timestamp": frame["timestamp"],
+                "cursor": dict(frame["cursor"]),
+                "changed_cells": frame["changed_cells"],
+            }
+            if with_full_snapshot:
+                f["snapshot"] = frame["snapshot"]
+            frames.append(f)
+        out = {
+            "width": self.width,
+            "height": self.height,
+            "total_frames": len(frames),
+            "frames": frames,
+        }
+        return json.dumps(out, indent=indent, ensure_ascii=ensure_ascii)
+
+    # --------- 内部实现 ---------
+
+    def _flatten_cells_for_diff(self) -> Tuple:
+        """把整个屏幕拍平成一个可哈希元组，用于快速判断快照是否变化。"""
+        out = []
+        for row in self.grid:
+            for cell in row:
+                out.append((
+                    cell.char, cell.fg, cell.bg,
+                    cell.fg_rgb, cell.bg_rgb, cell.style,
+                ))
+        return tuple(out)
+
+    def _build_snapshot_dict(self, only_changed: bool = False) -> dict:
+        """构造一份当前屏幕的精简快照（可选择只输出与上一帧不同的格子）。"""
+        rows = []
+        prev = self._prev_snapshot_cells
+        for r in range(self.height):
+            cells = []
+            for c in range(self.width):
+                cell = self.grid[r][c]
+                is_empty = (
+                    cell.char == " " and cell.style == 0 and
+                    cell.fg == COLOR_DEFAULT and cell.bg == COLOR_DEFAULT and
+                    cell.fg_rgb is None and cell.bg_rgb is None
+                )
+                if only_changed and prev is not None:
+                    flat = (
+                        cell.char, cell.fg, cell.bg,
+                        cell.fg_rgb, cell.bg_rgb, cell.style,
+                    )
+                    if flat == prev[r * self.width + c]:
+                        continue
+                if is_empty and not only_changed:
+                    continue
+                cd = self._cell_to_dict(cell)
+                cd["col"] = c
+                cells.append(cd)
+            if cells:
+                rows.append({"row": r, "cells": cells})
+        return {
+            "width": self.width,
+            "height": self.height,
+            "cursor": {
+                "row": self.cursor_row,
+                "col": self.cursor_col,
+                "visible": self.cursor_visible,
+            },
+            "scroll_region": {"top": self.scroll_top, "bottom": self.scroll_bottom},
+            "rows": rows,
+        }
+
+    def _record_snapshot(self, timestamp: Optional[float] = None) -> None:
+        import time as _time
+        if timestamp is None:
+            timestamp = _time.monotonic()
+        flat_now = self._flatten_cells_for_diff()
+        cursor_now = (self.cursor_row, self.cursor_col)
+        changed_cells = []
+        if self._prev_snapshot_cells is None:
+            for i, v in enumerate(flat_now):
+                r, c = divmod(i, self.width)
+                is_empty = (
+                    v[0] == " " and v[5] == 0 and
+                    v[1] == COLOR_DEFAULT and v[2] == COLOR_DEFAULT and
+                    v[3] is None and v[4] is None
+                )
+                if not is_empty:
+                    changed_cells.append([r, c])
+        else:
+            prev = self._prev_snapshot_cells
+            for i, v in enumerate(flat_now):
+                if v != prev[i]:
+                    r, c = divmod(i, self.width)
+                    changed_cells.append([r, c])
+        cursor_changed = (self._prev_snapshot_cursor is None or
+                          cursor_now != self._prev_snapshot_cursor)
+        frame_idx = len(self._history)
+        snapshot_dict = self._build_snapshot_dict(only_changed=False)
+        self._history.append({
+            "frame": frame_idx,
+            "timestamp": timestamp,
+            "cursor": {"row": self.cursor_row, "col": self.cursor_col,
+                       "visible": self.cursor_visible},
+            "cursor_changed": cursor_changed,
+            "changed_cells": changed_cells,
+            "snapshot": snapshot_dict,
+        })
+        self._prev_snapshot_cells = flat_now
+        self._prev_snapshot_cursor = cursor_now
 
 
 # =================================================================
@@ -1037,6 +1283,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
   # 输出带 ANSI 颜色的文本(保留颜色/加粗等属性)
   python ansi_terminal.py -f colored.txt --ansi
+
+  # 开启录制,导出所有帧和变更的差量 (用于进度条/刷屏分析)
+  python ansi_terminal.py -f build.log --record --history --output frames.json
+
+  # 从时间戳日志(每行 [HH:MM:SS.xxx] data...) 读取,回放输出 --at 指定时刻的快照
+  python ansi_terminal.py -f timed.log --timestamps --at 00:01:23.456 -W 80 -H 24
+
+  # JSON 增强: 带最终纯文本 + 标记有颜色/样式的单元格 + 光标历史
+  python ansi_terminal.py -f build.log --json --with-text --mark-styled --cursor-history
 """,
     )
     p.add_argument("-f", "--file", type=str, default=None,
@@ -1057,7 +1312,35 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="输出文件 (默认 stdout)")
     p.add_argument("--encoding", type=str, default="utf-8",
                    help="输入文件编码,默认 utf-8 (非法字节会用 U+FFFD 替换)")
+
+    p.add_argument("--record", action="store_true",
+                   help="开启录制,每次 feed() 记录一帧快照和变更 diff")
+    p.add_argument("--history", action="store_true",
+                   help="结合 --record 导出完整历史帧 JSON (history_to_json)")
+    p.add_argument("--with-snapshots", action="store_true",
+                   help="导出历史时附带每帧完整快照")
+    p.add_argument("--frame", type=int, default=None,
+                   help="仅输出录制中的第 N 帧 (从 0 开始,支持负数 -1 表示最后一帧)")
+
+    p.add_argument("--timestamps", action="store_true",
+                   help="输入是带前缀时间戳的日志,格式支持 HH:MM:SS[.mmm] / [secs.mmm] / +rel.ms")
+    p.add_argument("--ts-regex", type=str, default=None,
+                   help="自定义时间戳正则,要求分组1可以被 float() 或 HH:MM:SS 解析")
+    p.add_argument("--at", type=str, default=None,
+                   help="回放时间戳日志并只输出该时间点的屏幕 (格式 HH:MM:SS[.mmm] 或 秒数)")
+
+    p.add_argument("--with-text", action="store_true",
+                   help="JSON 中附带最终屏幕纯文本 (data.text 字段)")
+    p.add_argument("--mark-styled", action="store_true",
+                   help="JSON 为带颜色/样式的单元格加 styled=true 标记")
+    p.add_argument("--cursor-history", action="store_true",
+                   help="JSON 附带光标位置历史 (需先开启 --record)")
+    p.add_argument("--changed-only", action="store_true",
+                   help="JSON 附带最后一帧相对上一帧变更了的单元格坐标")
     return p
+
+
+_TS_RE = None
 
 
 def _read_input(args) -> bytes:
@@ -1066,6 +1349,81 @@ def _read_input(args) -> bytes:
             return f.read()
     else:
         return getattr(sys.stdin, "buffer", sys.stdin).read()
+
+
+def _parse_ts(s: str) -> Optional[float]:
+    """解析 HH:MM:SS.mmm / HH:MM:SS / 秒数字符串为浮点秒数。"""
+    if s is None:
+        return None
+    s = s.strip().strip("[]")
+    if not s:
+        return None
+    if s.startswith("+"):
+        s = s[1:]
+    if ":" in s:
+        parts = s.split(":")
+        try:
+            parts = [float(p) for p in parts]
+        except ValueError:
+            return None
+        while len(parts) < 3:
+            parts.insert(0, 0.0)
+        h, m, sec = parts[-3], parts[-2], parts[-1]
+        return h * 3600 + m * 60 + sec
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _split_timestamped_log(raw: bytes, ts_regex: Optional[str] = None) -> List[Tuple[float, bytes]]:
+    """
+    把字节流切分成 (相对时间秒数, payload_bytes) 列表。
+    默认识别前缀: HH:MM:SS[.mmm] 或 [ss.mmm] 或 +mmm.ms
+    无法识别时间戳的行附加到上一条(或 t=0)。
+    """
+    import re as _re
+    global _TS_RE
+    if ts_regex:
+        regex = _re.compile(ts_regex)
+    else:
+        if _TS_RE is None:
+            _TS_RE = _re.compile(
+                r"^\s*(?:\[?\s*)"
+                r"(?:"
+                r"(?:\d{1,2}:\d{2}:\d{2}(?:\.\d+)?)"
+                r"|(?:\+?\d+(?:\.\d+)?)"
+                r")"
+                r"(?:\s*\]?\s*)"
+            )
+        regex = _TS_RE
+
+    lines = raw.splitlines(True)
+    chunks: List[Tuple[float, bytes]] = []
+    cur_ts: Optional[float] = None
+    cur_buf: bytearray = bytearray()
+
+    def _flush():
+        nonlocal cur_buf
+        if cur_buf:
+            chunks.append((cur_ts if cur_ts is not None else 0.0, bytes(cur_buf)))
+            cur_buf = bytearray()
+
+    for line in lines:
+        head_text = line[:min(256, len(line))].decode("utf-8", errors="replace")
+        m = regex.match(head_text)
+        if m:
+            parsed = _parse_ts(m.group(0))
+            if parsed is not None:
+                _flush()
+                cur_ts = parsed
+                prefix_len_bytes = len(head_text[:m.end()].encode("utf-8", errors="replace"))
+                payload = line[prefix_len_bytes:] if prefix_len_bytes <= len(line) else b""
+                cur_buf.extend(payload)
+                continue
+        cur_buf.extend(line)
+    _flush()
+    return chunks
 
 
 def main(argv=None) -> int:
@@ -1087,23 +1445,64 @@ def main(argv=None) -> int:
         return 2
 
     try:
-        vt.feed_bytes(raw, final=True)
+        if args.record:
+            vt.start_recording()
+
+        if args.timestamps:
+            chunks = _split_timestamped_log(raw, args.ts_regex)
+            target_ts = _parse_ts(args.at) if args.at else None
+            last_chunks = chunks
+            if target_ts is not None:
+                stop_at = None
+                for i, (t, _) in enumerate(chunks):
+                    if t >= target_ts:
+                        stop_at = i
+                        break
+                if stop_at is None:
+                    stop_at = len(chunks)
+                last_chunks = chunks[:stop_at]
+            for t, payload in last_chunks:
+                if payload:
+                    vt.feed(payload, final=False)
+            vt.feed(b"", final=True)
+        else:
+            vt.feed(raw, final=True)
     except Exception as e:
         print(f"错误: 解析输入时异常: {e}", file=sys.stderr)
         return 3
 
     rstrip = not args.no_rstrip
-    if args.json:
-        out_text = vt.to_json(
+
+    render_vt = vt
+    if args.record and args.frame is not None:
+        snap = vt.seek_snapshot(args.frame)
+        if snap is None:
+            print("错误: 没有可用的录制帧", file=sys.stderr)
+            return 5
+        vt2 = VirtualTerminal(width=vt.width, height=vt.height)
+        vt2.replay_frames([{"snapshot": snap}])
+        render_vt = vt2
+
+    if args.history and args.record:
+        out_text = vt.history_to_json(
+            indent=2, ensure_ascii=False,
+            with_full_snapshot=args.with_snapshots,
+        )
+    elif args.json:
+        out_text = render_vt.to_json(
             include_empty=args.full,
             rstrip_lines=rstrip,
             rstrip_trailing=rstrip,
             ensure_ascii=False,
+            cursor_history=args.cursor_history,
+            changed_only=args.changed_only,
+            with_text=args.with_text,
+            mark_styled=args.mark_styled,
         )
     elif args.ansi:
-        out_text = vt.render_ansi(rstrip_lines=rstrip, rstrip_trailing=rstrip)
+        out_text = render_vt.render_ansi(rstrip_lines=rstrip, rstrip_trailing=rstrip)
     else:
-        out_text = vt.get_screen_text(rstrip_lines=rstrip, rstrip_trailing=rstrip)
+        out_text = render_vt.get_screen_text(rstrip_lines=rstrip, rstrip_trailing=rstrip)
 
     if args.output:
         try:
