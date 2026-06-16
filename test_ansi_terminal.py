@@ -405,6 +405,346 @@ def test_bright_colors():
     return ok
 
 
+def test_feed_bytes_basic():
+    print("\n=== Test 22: feed_bytes 基本 UTF-8 输入 ===")
+    vt = VirtualTerminal(width=30, height=5)
+    vt.feed_bytes("Hello 世界".encode("utf-8"))
+    ok = assert_eq(vt.get_line_text(0), "Hello 世界", "UTF-8 Chinese rendered")
+    ok &= assert_eq(vt.cursor_col, 8, "cursor after 8 chars")
+
+    ba = bytearray(b"bytearray input")
+    vt2 = VirtualTerminal(width=30, height=5)
+    vt2.feed_bytes(ba)
+    ok &= assert_eq(vt2.get_line_text(0), "bytearray input", "bytearray accepted")
+
+    mv = memoryview(b"memoryview works")
+    vt3 = VirtualTerminal(width=30, height=5)
+    vt3.feed_bytes(mv)
+    ok &= assert_eq(vt3.get_line_text(0), "memoryview works", "memoryview accepted")
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_feed_bytes_split_utf8():
+    print("\n=== Test 23: UTF-8 半个字符跨 chunk 不乱码 ===")
+    text = "Aä中🙂"
+    encoded = text.encode("utf-8")
+    vt_full = VirtualTerminal(width=30, height=5)
+    vt_full.feed_bytes(encoded)
+    expected = vt_full.get_screen_text()
+
+    for split_point in range(1, len(encoded)):
+        vt = VirtualTerminal(width=30, height=5)
+        vt.feed_bytes(encoded[:split_point], final=False)
+        vt.feed_bytes(encoded[split_point:], final=True)
+        got = vt.get_screen_text()
+        if got != expected:
+            print(f"  Split at {split_point} failed")
+            print(f"  expected: {repr(expected)}")
+            print(f"  actual:   {repr(got)}")
+            return False
+
+    vt_multi = VirtualTerminal(width=30, height=5)
+    for b in encoded:
+        vt_multi.feed_bytes(bytes([b]), final=False)
+    vt_multi.feed_bytes(b"", final=True)
+    ok = assert_eq(vt_multi.get_screen_text(), expected, "byte-by-byte decode matches")
+
+    ok &= assert_eq(vt_full.get_line_text(0), text, "full expected text")
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_feed_bytes_invalid_utf8():
+    print("\n=== Test 24: 非法 UTF-8 字节不崩溃 (errors=replace) ===")
+    vt = VirtualTerminal(width=30, height=5)
+    bad = b"Hello \xff\xfe\x00 World"
+    raised = False
+    try:
+        vt.feed_bytes(bad)
+    except Exception as e:
+        raised = True
+        print(f"  EXCEPTION: {e}")
+    ok = assert_eq(raised, False, "no exception on bad bytes")
+    ok &= assert_eq("Hello" in vt.get_screen_text(), True, "text Hello present")
+    ok &= assert_eq("World" in vt.get_screen_text(), True, "text World present")
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_decstbm_default_params():
+    print("\n=== Test 25: DECSTBM 省略参数恢复整屏滚动 ===")
+    vt = VirtualTerminal(width=30, height=10)
+    vt.feed(f"{ESC}[3;8r")
+    ok = assert_eq(vt.scroll_top, 2, "After ESC[3;8r: top=2")
+    ok &= assert_eq(vt.scroll_bottom, 7, "After ESC[3;8r: bottom=7")
+
+    vt.feed(f"{ESC}[r")
+    ok &= assert_eq(vt.scroll_top, 0, "ESC[r → top=0 (full screen)")
+    ok &= assert_eq(vt.scroll_bottom, 9, "ESC[r → bottom=9 (full screen)")
+
+    vt.feed(f"{ESC}[4;7r")
+    vt.feed(f"{ESC}[;r")
+    ok &= assert_eq(vt.scroll_top, 0, "ESC[;r → top=0")
+    ok &= assert_eq(vt.scroll_bottom, 9, "ESC[;r → bottom=9")
+
+    vt.feed(f"{ESC}[5;6r")
+    vt.feed(f"{ESC}[0;0r")
+    ok &= assert_eq(vt.scroll_top, 0, "ESC[0;0r → top=0")
+    ok &= assert_eq(vt.scroll_bottom, 9, "ESC[0;0r → bottom=9")
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_save_restore_cursor_esc78():
+    print("\n=== Test 26: ESC 7/8 保存恢复光标 + 属性 ===")
+    vt = VirtualTerminal(width=30, height=10)
+    vt.feed(f"{ESC}[5;15H")
+    vt.feed(f"{ESC}[1;31m")
+    vt.feed("\x1b7")
+    ok = assert_eq(vt.cursor_row, 4, "before save: row 4")
+    ok &= assert_eq(vt.cursor_col, 14, "before save: col 14")
+    ok &= assert_eq(vt.rendition.fg, 1, "before save: FG red")
+
+    vt.feed(f"{ESC}[10;1H")
+    vt.feed(f"{ESC}[32m")
+    ok &= assert_eq(vt.cursor_row, 9, "moved to row 9")
+    ok &= assert_eq(vt.rendition.fg, 2, "changed to FG green")
+
+    vt.feed("\x1b8")
+    ok &= assert_eq(vt.cursor_row, 4, "restore: row 4")
+    ok &= assert_eq(vt.cursor_col, 14, "restore: col 14")
+    ok &= assert_eq(vt.rendition.fg, 1, "restore: FG red back")
+    ok &= assert_eq(bool(vt.rendition.style & STYLE_BOLD), True, "restore: bold back")
+
+    vt2 = VirtualTerminal(width=30, height=10)
+    vt2.feed("\x1b8")
+    ok &= assert_eq(vt2.cursor_row, 0, "restore without save → row 0")
+    ok &= assert_eq(vt2.cursor_col, 0, "restore without save → col 0")
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_insert_delete_chars_ich_dch():
+    print("\n=== Test 27: 插入字符 ICH(@) / 删除字符 DCH(P) ===")
+    vt = VirtualTerminal(width=20, height=5)
+    vt.feed("ABCDEFGHIJ")
+    vt.feed(f"{ESC}[1;5H")
+    vt.feed(f"{ESC}[3@")
+    line = vt.get_line_text(0)
+    ok = assert_eq(line, "ABCD   EFGHIJ".rstrip(), "ICH 3 at col4 inserts 3 spaces")
+
+    vt2 = VirtualTerminal(width=20, height=5)
+    vt2.feed("ABCDEFGHIJKLMNOPQRST")
+    vt2.feed(f"{ESC}[1;6H")
+    vt2.feed(f"{ESC}[4P")
+    ok &= assert_eq(vt2.get_line_text(0), "ABCDEJKLMNOPQRST".ljust(20).rstrip(),
+                   "DCH 4 at col5 removes F G H I")
+
+    vt3 = VirtualTerminal(width=10, height=3)
+    vt3.feed("0123456789")
+    vt3.feed(f"{ESC}[1;8H")
+    vt3.feed(f"{ESC}[5@")
+    ok &= assert_eq(vt3.get_line_text(0), "0123456     ".rstrip(),
+                   "ICH 5 near end: inserts 5 spaces, chars shifted out dropped")
+
+    vt4 = VirtualTerminal(width=10, height=3)
+    vt4.feed("ABCDEFGHIJ")
+    vt4.feed(f"{ESC}[1;6H")
+    vt4.feed(f"{ESC}[10P")
+    ok &= assert_eq(vt4.get_line_text(0), "ABCDE",
+                   "DCH 10 deletes everything from cursor, pad with spaces")
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_insert_delete_lines_il_dl():
+    print("\n=== Test 28: 插入行 IL(L) / 删除行 DL(M) ===")
+    vt = VirtualTerminal(width=20, height=8)
+    for i in range(6):
+        vt.feed(f"Row{i}\n")
+
+    vt.feed(f"{ESC}[3;1H")
+    vt.feed(f"{ESC}[2L")
+    ok = assert_eq(vt.get_line_text(0), "Row0", "IL 2: Row0 intact")
+    ok &= assert_eq(vt.get_line_text(1), "Row1", "IL 2: Row1 intact")
+    ok &= assert_eq(vt.get_line_text(2).strip(), "", "IL 2: Row2 empty (inserted)")
+    ok &= assert_eq(vt.get_line_text(3).strip(), "", "IL 2: Row3 empty (inserted)")
+    ok &= assert_eq(vt.get_line_text(4), "Row2", "IL 2: Row4 = old Row2")
+    ok &= assert_eq(vt.get_line_text(6), "Row4", "IL 2: Row6 = old Row4")
+
+    vt2 = VirtualTerminal(width=20, height=8)
+    for i in range(6):
+        vt2.feed(f"Row{i}\n")
+    vt2.feed(f"{ESC}[2;1H")
+    vt2.feed(f"{ESC}[2M")
+    ok &= assert_eq(vt2.get_line_text(0), "Row0", "DL 2: Row0 intact")
+    ok &= assert_eq(vt2.get_line_text(1), "Row3", "DL 2: Row1 = old Row3")
+    ok &= assert_eq(vt2.get_line_text(2), "Row4", "DL 2: Row2 = old Row4")
+    ok &= assert_eq(vt2.get_line_text(4).strip(), "", "DL 2: last lines empty")
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_ncurses_like_workflow():
+    print("\n=== Test 29: ncurses 风格综合流程 ===")
+    vt = VirtualTerminal(width=40, height=10)
+
+    vt.feed(f"{ESC}[2J{ESC}[H")
+    vt.feed(f"{ESC}[1;30;47mHeader: Title{ESC}[0m")
+    vt.feed(f"{ESC}[2;1H")
+    for i in range(1, 6):
+        vt.feed(f"Item {i}: data{i:04d}\n")
+
+    vt.feed(f"{ESC}[5;1H")
+    vt.feed(f"{ESC}[1L")
+    vt.feed(f"{ESC}[5;1H")
+    vt.feed(f"  -> Inserted row here")
+
+    vt.feed(f"{ESC}[3;5H")
+    vt.feed(f"{ESC}[2@")
+    vt.feed(f"{ESC}[1;33mXX{ESC}[0m")
+
+    vt.feed(f"{ESC}[10;1H")
+    vt.feed(f"Status bar at bottom")
+
+    ok = "Header: Title" in vt.get_line_text(0)
+    ok &= "Inserted row here" in vt.get_line_text(4)
+    ok &= "Status bar at bottom" in vt.get_line_text(9)
+    ok &= assert_eq(ok, True, "ncurses-style flow works")
+
+    c = vt.get_cell(2, 4)
+    ok &= assert_eq(c.char, "X", "inserted XX first char")
+    ok &= assert_eq(c.fg, 3, "XX yellow FG")
+
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_json_export():
+    print("\n=== Test 30: JSON 导出功能 ===")
+    vt = VirtualTerminal(width=10, height=4)
+    vt.feed(f"{ESC}[1;31mHi{ESC}[0m")
+    vt.feed(f"{ESC}[2;1H")
+    vt.feed(f"{ESC}[38;5;196mRed{ESC}[0m")
+
+    json_str = vt.to_json(indent=2)
+    ok = assert_eq(isinstance(json_str, str), True, "json returns str")
+    data = json.loads(json_str)
+    ok &= assert_eq(data["width"], 10, "width in JSON")
+    ok &= assert_eq(data["height"], 4, "height in JSON")
+    ok &= assert_eq(data["cursor"]["row"], 1, "cursor row in JSON")
+    ok &= assert_eq(data["scroll_region"]["top"], 0, "scroll region top")
+
+    rows = data["rows"]
+    ok &= assert_eq(len(rows) >= 2, True, "at least 2 rows with content")
+
+    r0_cells = [r for r in rows if r["row"] == 0][0]["cells"]
+    hi_cell = [c for c in r0_cells if c["col"] == 0][0]
+    ok &= assert_eq(hi_cell["ch"], "H", "cell H at row0 col0")
+    ok &= assert_eq(hi_cell["fg"], 1, "cell H red FG")
+    ok &= assert_eq("bold" in hi_cell.get("style_names", []), True, "bold in style_names")
+
+    r1_cells = [r for r in rows if r["row"] == 1][0]["cells"]
+    red_cell = [c for c in r1_cells if c["col"] == 0][0]
+    ok &= assert_eq(red_cell["fg"], 196, "256-color index 196")
+
+    full_json = vt.to_json(include_empty=True, indent=None,
+                           rstrip_lines=False, rstrip_trailing=False)
+    full_data = json.loads(full_json)
+    total_cells = sum(len(r["cells"]) for r in full_data["rows"])
+    ok &= assert_eq(total_cells, 4 * 10, "full export = 4x10 = 40 cells")
+
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_cli_args_and_helpers():
+    print("\n=== Test 31: CLI 参数解析和便捷函数 ===")
+    from ansi_terminal import _build_arg_parser, main, render_terminal_output
+    parser = _build_arg_parser()
+    args = parser.parse_args([])
+    ok = assert_eq(args.width, 80, "default width=80")
+    ok &= assert_eq(args.height, 24, "default height=24")
+    ok &= assert_eq(args.json, False, "default no json")
+    ok &= assert_eq(args.ansi, False, "default no ansi")
+
+    args2 = parser.parse_args(["-W", "120", "-H", "50", "--json", "--full"])
+    ok &= assert_eq(args2.width, 120, "custom width")
+    ok &= assert_eq(args2.height, 50, "custom height")
+    ok &= assert_eq(args2.json, True, "json flag")
+    ok &= assert_eq(args2.full, True, "full flag")
+
+    out = render_terminal_output("Hello\nWorld\n", width=40, height=5)
+    ok &= assert_eq("Hello" in out and "World" in out, True, "render_terminal_output works")
+
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=".log", delete=False) as tmp:
+        tmp.write(b"\x1b[1mBold\x1b[0m text\nNext line")
+        tmp_path = tmp.name
+    try:
+        rc = main(["-f", tmp_path, "-W", "60", "-H", "10", "-o", os.devnull])
+        ok &= assert_eq(rc, 0, f"CLI file mode exit code {rc}")
+        rc2 = main(["-f", tmp_path, "--json", "-o", os.devnull])
+        ok &= assert_eq(rc2, 0, f"CLI json mode exit code {rc2}")
+        rc3 = main(["-f", tmp_path, "--ansi", "-o", os.devnull])
+        ok &= assert_eq(rc3, 0, f"CLI ansi mode exit code {rc3}")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+
+    rc_bad = main(["-f", "/nonexistent/zzz_12345.log", "-o", os.devnull])
+    ok &= assert_eq(rc_bad, 2, "missing file returns 2")
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+def test_chunked_bytes_matches_full_string():
+    print("\n=== Test 32: 分块字节流 = 一次性完整字符串 ===")
+    data = (
+        f"{ESC}[2J{ESC}[H"
+        f"{ESC}[1;36m+--------+{ESC}[0m\n"
+        f"{ESC}[1;36m|{ESC}[0m AAAAAA {ESC}[1;36m|{ESC}[0m\n"
+        f"{ESC}[1;36m|{ESC}[0m {ESC}[31mBBBB{ESC}[0m {ESC}[1;36m|{ESC}[0m\n"
+        f"{ESC}[1;36m+--------+{ESC}[0m\n"
+        f"UTF-8: \u4e2d\u6587 emoji: \U0001F600"
+    ).encode("utf-8")
+
+    vt_str = VirtualTerminal(30, 12)
+    vt_str.feed(data.decode("utf-8"))
+
+    import random
+    random.seed(42)
+    for _ in range(20):
+        vt_chunk = VirtualTerminal(30, 12)
+        i = 0
+        while i < len(data):
+            size = random.randint(1, 7)
+            end = min(i + size, len(data))
+            vt_chunk.feed_bytes(data[i:end], final=(end >= len(data)))
+            i = end
+        ok = (vt_str.get_screen_text() == vt_chunk.get_screen_text())
+        if not ok:
+            print("  random chunk mismatch")
+            print(f"  expected: {repr(vt_str.get_screen_text())}")
+            print(f"  actual:   {repr(vt_chunk.get_screen_text())}")
+            return False
+
+    vt_1b = VirtualTerminal(30, 12)
+    for b in data:
+        vt_1b.feed_bytes(bytes([b]), final=False)
+    vt_1b.feed_bytes(b"", final=True)
+    ok = assert_eq(vt_1b.get_screen_text(), vt_str.get_screen_text(),
+                   "1-byte chunking matches full string")
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+import json
+
+
 def run_all_tests():
     print("=" * 60)
     print("ANSI 终端转义序列处理引擎 测试套件")
@@ -432,6 +772,17 @@ def run_all_tests():
         test_integration_complex_output,
         test_origin_mode,
         test_bright_colors,
+        test_feed_bytes_basic,
+        test_feed_bytes_split_utf8,
+        test_feed_bytes_invalid_utf8,
+        test_decstbm_default_params,
+        test_save_restore_cursor_esc78,
+        test_insert_delete_chars_ich_dch,
+        test_insert_delete_lines_il_dl,
+        test_ncurses_like_workflow,
+        test_json_export,
+        test_cli_args_and_helpers,
+        test_chunked_bytes_matches_full_string,
     ]
 
     passed = 0

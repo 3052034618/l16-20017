@@ -10,9 +10,13 @@ ANSI 终端转义序列处理引擎
 - 字符网格: 每个单元格包含字符、前景色、背景色、样式位
 """
 
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from dataclasses import dataclass, field, asdict
+from typing import List, Optional, Tuple, Union, TextIO, BinaryIO
 import io
+import codecs
+import json
+import argparse
+import sys
 
 
 # ==================== 样式位掩码 ====================
@@ -154,6 +158,9 @@ class VirtualTerminal:
         self._csi_intermediates: List[str] = []
         self._osc_buf = ""
         self._pending_esc = False
+
+        self._utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._saved_cursor: Optional[dict] = None
 
     # =================================================================
     # 屏幕基础操作
@@ -443,7 +450,9 @@ class VirtualTerminal:
         private = len(self._csi_intermediates) > 0 and self._csi_intermediates[0] == "?"
 
         if not private:
-            if final == "A":
+            if final == "@":
+                self.insert_chars(params[0] if params else 1)
+            elif final == "A":
                 self.cursor_up(params[0] if params else 1)
             elif final == "B":
                 self.cursor_down(params[0] if params else 1)
@@ -477,6 +486,12 @@ class VirtualTerminal:
                     self.clear_from_start_to_cursor_line()
                 elif mode == 2:
                     self.clear_row(self.cursor_row)
+            elif final == "L":
+                self.insert_lines(params[0] if params else 1)
+            elif final == "M":
+                self.delete_lines(params[0] if params else 1)
+            elif final == "P":
+                self.delete_chars(params[0] if params else 1)
             elif final == "S":
                 self.scroll_up(params[0] if params else 1)
             elif final == "T":
@@ -484,9 +499,16 @@ class VirtualTerminal:
             elif final == "m":
                 self.apply_sgr(params)
             elif final == "r":
-                top = params[0] if len(params) >= 1 else 1
-                bottom = params[1] if len(params) >= 2 else self.height
-                self.set_scroll_region(top - 1, bottom - 1)
+                top_param = params[0] if (len(params) >= 1 and params[0] > 0) else 1
+                bottom_param = params[1] if (len(params) >= 2 and params[1] > 0) else self.height
+                top = top_param - 1
+                bottom = bottom_param - 1
+                if (len(params) == 0 or
+                    (len(params) == 1 and params[0] == 0) or
+                    (len(params) >= 1 and params[0] <= 0 and (len(params) == 1 or params[1] <= 0))):
+                    top = 0
+                    bottom = self.height - 1
+                self.set_scroll_region(top, bottom)
                 self.cursor_position(1, 1)
             elif final == "l":
                 if params and params[0] == 7:
@@ -528,6 +550,7 @@ class VirtualTerminal:
             self.rendition.reset()
             self.scroll_top = 0
             self.scroll_bottom = self.height - 1
+            self._saved_cursor = None
         elif ch == "D":
             if self.cursor_row >= self.scroll_bottom:
                 self.scroll_up(1)
@@ -542,9 +565,133 @@ class VirtualTerminal:
             self.cursor_col = 0
             self._handle_newline()
         elif ch == "7":
-            pass
+            self.save_cursor()
         elif ch == "8":
-            pass
+            self.restore_cursor()
+
+    # =================================================================
+    # 字节流/数据流输入接口 (支持 bytes, bytearray, 分块读取)
+    # =================================================================
+
+    def feed_bytes(self, data: Union[bytes, bytearray, memoryview], final: bool = True):
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            data = bytes(data)
+        else:
+            raise TypeError(f"feed_bytes expects bytes/bytearray/memoryview, got {type(data).__name__}")
+        text = self._utf8_decoder.decode(data, final=final)
+        if text:
+            self.feed(text)
+
+    def feed_stream(self, stream: BinaryIO, chunk_size: int = 8192):
+        while True:
+            chunk = stream.read(chunk_size)
+            if not chunk:
+                self.feed_bytes(b"", final=True)
+                break
+            self.feed_bytes(chunk, final=False)
+
+    def reset_decoder(self):
+        self._utf8_decoder.reset()
+
+    # =================================================================
+    # 保存/恢复光标 (DECSC / DECRC)
+    # =================================================================
+
+    def save_cursor(self):
+        self._saved_cursor = {
+            "row": self.cursor_row,
+            "col": self.cursor_col,
+            "fg": self.rendition.fg,
+            "bg": self.rendition.bg,
+            "fg_rgb": self.rendition.fg_rgb,
+            "bg_rgb": self.rendition.bg_rgb,
+            "style": self.rendition.style,
+            "origin_mode": self.origin_mode,
+            "auto_wrap": self.auto_wrap,
+        }
+
+    def restore_cursor(self):
+        if self._saved_cursor is None:
+            self.cursor_row = 0
+            self.cursor_col = 0
+            return
+        s = self._saved_cursor
+        self.cursor_row = s["row"]
+        self.cursor_col = s["col"]
+        self.rendition.fg = s["fg"]
+        self.rendition.bg = s["bg"]
+        self.rendition.fg_rgb = s["fg_rgb"]
+        self.rendition.bg_rgb = s["bg_rgb"]
+        self.rendition.style = s["style"]
+        self.origin_mode = s.get("origin_mode", False)
+        self.auto_wrap = s.get("auto_wrap", True)
+        self._clamp_cursor()
+
+    # =================================================================
+    # 插入/删除 字符 (ICH / DCH)
+    # =================================================================
+
+    def insert_chars(self, n: int = 1):
+        if n <= 0:
+            n = 1
+        if not (0 <= self.cursor_row < self.height):
+            return
+        row = self.grid[self.cursor_row]
+        start = self.cursor_col
+        end = min(start + n, self.width)
+        shift = end - start
+        if shift <= 0:
+            return
+        for c in range(self.width - 1, end - 1, -1):
+            row[c].copy_from(row[c - shift])
+        for c in range(start, end):
+            row[c].reset()
+
+    def delete_chars(self, n: int = 1):
+        if n <= 0:
+            n = 1
+        if not (0 <= self.cursor_row < self.height):
+            return
+        row = self.grid[self.cursor_row]
+        start = self.cursor_col
+        move_end = min(start + n, self.width)
+        shift = move_end - start
+        if shift <= 0:
+            return
+        for c in range(start, self.width - shift):
+            row[c].copy_from(row[c + shift])
+        for c in range(self.width - shift, self.width):
+            row[c].reset()
+
+    # =================================================================
+    # 插入/删除 行 (IL / DL) —— 仅在滚动区域内生效
+    # =================================================================
+
+    def insert_lines(self, n: int = 1):
+        if n <= 0:
+            n = 1
+        if not (self.scroll_top <= self.cursor_row <= self.scroll_bottom):
+            return
+        n = min(n, self.scroll_bottom - self.cursor_row + 1)
+        for _ in range(n):
+            for r in range(self.scroll_bottom, self.cursor_row, -1):
+                for c in range(self.width):
+                    self.grid[r][c].copy_from(self.grid[r - 1][c])
+            for c in range(self.width):
+                self.grid[self.cursor_row][c].reset()
+
+    def delete_lines(self, n: int = 1):
+        if n <= 0:
+            n = 1
+        if not (self.scroll_top <= self.cursor_row <= self.scroll_bottom):
+            return
+        n = min(n, self.scroll_bottom - self.cursor_row + 1)
+        for _ in range(n):
+            for r in range(self.cursor_row, self.scroll_bottom):
+                for c in range(self.width):
+                    self.grid[r][c].copy_from(self.grid[r + 1][c])
+            for c in range(self.width):
+                self.grid[self.scroll_bottom][c].reset()
 
     # =================================================================
     # 主解析循环 —— 状态机
@@ -572,12 +719,12 @@ class VirtualTerminal:
                 self._parse_state = ParseState.CSI_ENTRY
             elif ch == "]":
                 self._parse_state = ParseState.OSC_STRING
-            elif "0" <= ch <= "9" or ch == ";" or "<" <= ch <= "?" or " " <= ch <= "/":
+            elif " " <= ch <= "/":
+                self._csi_intermediates.append(ch)
                 self._parse_state = ParseState.CSI_INTERMEDIATE
-                if " " <= ch <= "/":
-                    self._csi_intermediates.append(ch)
-                elif "0" <= ch <= "9" or ch == ";":
-                    self._csi_param_buf += ch
+            elif 0x30 <= ord(ch) <= 0x7E:
+                self._dispatch_escape(ch)
+                self._parse_state = ParseState.GROUND
             else:
                 self._dispatch_escape(ch)
                 self._parse_state = ParseState.GROUND
@@ -769,6 +916,84 @@ class VirtualTerminal:
             fg_rgb=c.fg_rgb, bg_rgb=c.bg_rgb, style=c.style
         ) for c in row] for row in self.grid]
 
+    # =================================================================
+    # JSON 序列化导出
+    # =================================================================
+
+    def _cell_to_dict(self, cell: Cell) -> dict:
+        d = {"ch": cell.char}
+        if cell.fg != COLOR_DEFAULT:
+            d["fg"] = cell.fg
+        if cell.bg != COLOR_DEFAULT:
+            d["bg"] = cell.bg
+        if cell.fg_rgb is not None:
+            d["fg_rgb"] = list(cell.fg_rgb)
+        if cell.bg_rgb is not None:
+            d["bg_rgb"] = list(cell.bg_rgb)
+        if cell.style != 0:
+            d["style"] = cell.style
+            style_names = []
+            if cell.style & STYLE_BOLD: style_names.append("bold")
+            if cell.style & STYLE_DIM: style_names.append("dim")
+            if cell.style & STYLE_ITALIC: style_names.append("italic")
+            if cell.style & STYLE_UNDERLINE: style_names.append("underline")
+            if cell.style & STYLE_BLINK: style_names.append("blink")
+            if cell.style & STYLE_REVERSE: style_names.append("reverse")
+            if cell.style & STYLE_HIDDEN: style_names.append("hidden")
+            if cell.style & STYLE_STRIKETHROUGH: style_names.append("strikethrough")
+            if style_names:
+                d["style_names"] = style_names
+        return d
+
+    def to_dict(self, include_empty: bool = False, rstrip_lines: bool = True,
+                rstrip_trailing: bool = True) -> dict:
+        rows = []
+        last_non_empty = -1
+        for r in range(self.height):
+            cells = []
+            has_content = False
+            for c in range(self.width):
+                cell = self.grid[r][c]
+                is_empty = (
+                    cell.char == " " and cell.style == 0 and
+                    cell.fg == COLOR_DEFAULT and cell.bg == COLOR_DEFAULT and
+                    cell.fg_rgb is None and cell.bg_rgb is None
+                )
+                if include_empty or not is_empty:
+                    cd = self._cell_to_dict(cell)
+                    cd["col"] = c
+                    cells.append(cd)
+                    if not is_empty:
+                        has_content = True
+            if rstrip_lines:
+                while cells and (cells[-1]["ch"] == " " and len(cells[-1]) <= 2):
+                    cells.pop()
+            row_data = {"row": r, "cells": cells}
+            if has_content or not rstrip_trailing:
+                rows.append(row_data)
+                last_non_empty = r
+            elif not rstrip_trailing:
+                rows.append(row_data)
+        if rstrip_trailing and last_non_empty >= 0:
+            rows = [row for row in rows if row["row"] <= last_non_empty]
+        return {
+            "width": self.width,
+            "height": self.height,
+            "cursor": {"row": self.cursor_row, "col": self.cursor_col,
+                       "visible": self.cursor_visible},
+            "scroll_region": {"top": self.scroll_top, "bottom": self.scroll_bottom},
+            "mode": {"auto_wrap": self.auto_wrap, "origin_mode": self.origin_mode},
+            "rows": rows,
+        }
+
+    def to_json(self, indent: Optional[int] = 2, include_empty: bool = False,
+                rstrip_lines: bool = True, rstrip_trailing: bool = True,
+                ensure_ascii: bool = False) -> str:
+        data = self.to_dict(include_empty=include_empty,
+                            rstrip_lines=rstrip_lines,
+                            rstrip_trailing=rstrip_trailing)
+        return json.dumps(data, indent=indent, ensure_ascii=ensure_ascii)
+
 
 # =================================================================
 # 便捷函数
@@ -788,3 +1013,119 @@ def parse_and_snapshot(output: str, width: int = 80, height: int = 24) -> Virtua
     vt = VirtualTerminal(width=width, height=height)
     vt.feed(output)
     return vt
+
+
+# =================================================================
+# CLI 命令行入口
+# =================================================================
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="ansi_terminal",
+        description="ANSI 终端转义序列渲染引擎：把带 ANSI 码的字节流渲染成纯文本快照或 JSON",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+示例:
+  # 从文件读取,默认 80x24,输出纯文本
+  python ansi_terminal.py -f output.log
+
+  # 从 stdin 管道输入,自定义尺寸,导出 JSON
+  curl -s https://example.com | some_cmd | python ansi_terminal.py -W 120 -H 50 --json
+
+  # 导出属性完整的 JSON(含空格单元格)并重定向到文件
+  python ansi_terminal.py -f build.log --json --full --output snapshot.json
+
+  # 输出带 ANSI 颜色的文本(保留颜色/加粗等属性)
+  python ansi_terminal.py -f colored.txt --ansi
+""",
+    )
+    p.add_argument("-f", "--file", type=str, default=None,
+                   help="输入文件路径 (默认或 '-' 时从 stdin 读取)")
+    p.add_argument("-W", "--width", type=int, default=80,
+                   help="虚拟终端宽度 (列数),默认 80")
+    p.add_argument("-H", "--height", type=int, default=24,
+                   help="虚拟终端高度 (行数),默认 24")
+    p.add_argument("--json", action="store_true",
+                   help="输出 JSON 格式 (含每个单元格的属性)")
+    p.add_argument("--ansi", action="store_true",
+                   help="输出带 ANSI 颜色/加粗属性的文本 (默认纯文本)")
+    p.add_argument("--full", action="store_true",
+                   help="JSON 输出时包含空格/空单元格 (默认省略)")
+    p.add_argument("--no-rstrip", action="store_true",
+                   help="不删除行尾空格和空行 (默认会 rstrip)")
+    p.add_argument("-o", "--output", type=str, default=None,
+                   help="输出文件 (默认 stdout)")
+    p.add_argument("--encoding", type=str, default="utf-8",
+                   help="输入文件编码,默认 utf-8 (非法字节会用 U+FFFD 替换)")
+    return p
+
+
+def _read_input(args) -> bytes:
+    if args.file and args.file != "-":
+        with open(args.file, "rb") as f:
+            return f.read()
+    else:
+        return getattr(sys.stdin, "buffer", sys.stdin).read()
+
+
+def main(argv=None) -> int:
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+
+    if args.width <= 0 or args.height <= 0:
+        parser.error("width 和 height 必须是正整数")
+
+    vt = VirtualTerminal(width=args.width, height=args.height)
+
+    try:
+        raw = _read_input(args)
+    except FileNotFoundError as e:
+        print(f"错误: 无法打开文件: {e}", file=sys.stderr)
+        return 2
+    except OSError as e:
+        print(f"错误: 读取输入失败: {e}", file=sys.stderr)
+        return 2
+
+    try:
+        vt.feed_bytes(raw, final=True)
+    except Exception as e:
+        print(f"错误: 解析输入时异常: {e}", file=sys.stderr)
+        return 3
+
+    rstrip = not args.no_rstrip
+    if args.json:
+        out_text = vt.to_json(
+            include_empty=args.full,
+            rstrip_lines=rstrip,
+            rstrip_trailing=rstrip,
+            ensure_ascii=False,
+        )
+    elif args.ansi:
+        out_text = vt.render_ansi(rstrip_lines=rstrip, rstrip_trailing=rstrip)
+    else:
+        out_text = vt.get_screen_text(rstrip_lines=rstrip, rstrip_trailing=rstrip)
+
+    if args.output:
+        try:
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(out_text)
+                if not out_text.endswith("\n"):
+                    f.write("\n")
+        except OSError as e:
+            print(f"错误: 写入输出失败: {e}", file=sys.stderr)
+            return 4
+    else:
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+        sys.stdout.write(out_text)
+        if not out_text.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
